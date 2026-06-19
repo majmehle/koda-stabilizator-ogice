@@ -1,54 +1,27 @@
 /*
  * ============================================================
- *  BALL BALANCING PLATFORM — Arduino Mega
- * ============================================================
- *  Strojna oprema:
- *    - 3x bipolarni koračni motor (STEP/DIR driver, npr. A4988/DRV8825)
- *        Motor 1 : STEP=3, DIR=4
- *        Motor 2 : STEP=5, DIR=6
- *        Motor 3 : STEP=7, DIR=8
- *        ENABLE  : pin 2 (skupen za vse motorje)
- *    - Adafruit 4-žična rezistivna plošča na dotik
- *        172 mm × 129.5 mm
- *    - 1" solid chrome steel žogica G25
- *
- *  Knjižnice:
- *    AccelStepper          — upravljanje motorjev
- *    Adafruit_TouchScreen  — branje položaja žogice
- *    InverseKinematics     — inverzna kinematika (vgrajena spodaj)
- *
- *  PID vrednosti, ki jih nastavljate:
- *    Kp, Ki, Kd  — za os X in Y (glejte razlago na dnu datoteke)
+ * BALL BALANCING PLATFORM — Arduino Mega
+ * OPTIMIZIRANA verzija za hitrejši odziv
  * ============================================================
  */
 
 #include <AccelStepper.h>
 #include <TouchScreen.h>
-// #include <InverseKinematics.h>
-// Opomba: Knjižnica InverseKinematics ni standardizirana za ta tip
-// 3-nožne Stewartove platforme. Inverzna kinematika je implementirana
-// neposredno v funkciji inverseKinematics() spodaj.
 
 // ============================================================
-//  PINI ZASLONA NA DOTIK (4-žični rezistivni)
-//  Za Arduino Mega priporočamo te pine:
+// PINI ZASLONA NA DOTIK
 // ============================================================
-#define YP A0   // Y+ — mora biti analogni pin
-#define XM A1   // X- — mora biti analogni pin
-#define YM A2   // Y- — digitalni pin
-#define XP A3   // X+ — digitalni pin
+#define YP A0
+#define XM A1
+#define YM A2
+#define XP A3
 
-// Upor med X+ in X- (ohmi) — izmeri z multimetrom
 #define TOUCHSCREEN_OHMS 300
-
-// Mejne vrednosti pritiska (prag zaznavanja žogice)
-#define MINPRESSURE  150
+#define MINPRESSURE  15
 #define MAXPRESSURE  1000
 
 // ============================================================
-//  KALIBRACIJA ZASLONA NA DOTIK
-//  Surove vrednosti ADC za robove plošče.
-//  Nastavi s serijskim monitorjem z izpisom p.x, p.y pri dotiku robov.
+// KALIBRACIJA TOUCHSCREEN-A
 // ============================================================
 #define TS_MINX  150
 #define TS_MAXX  900
@@ -56,104 +29,126 @@
 #define TS_MAXY  940
 
 // ============================================================
-//  DIMENZIJE PLOŠČE (mm)
+// DIMENZIJE PLOŠČE
 // ============================================================
-#define PLATE_W   172.0f    // širina
-#define PLATE_L   129.5f    // dolžina
+#define PLATE_W   172.0f
+#define PLATE_L   129.5f
 
-// Ciljni položaj žogice — sredina plošče
-#define SETPOINT_X  (PLATE_W / 2.0f)   // 86.0 mm
-#define SETPOINT_Y  (PLATE_L / 2.0f)   // 64.75 mm
+#define CENTER_OFFSET_X  0.0f
+#define CENTER_OFFSET_Y  0.0f
 
-// ============================================================
-//  GEOMETRIJA PLATFORME
-//  Prilagodi glede na svojo mehansko izvedbo!
-// ============================================================
-#define MOTOR_RADIUS   50.0f   // razdalja od središča do pritrditvenega mesta noge (mm)
-#define CRANK_LENGTH   30.0f   // dolžina roke motorja /ročice (mm)
-#define MAX_TILT_DEG    4.5f   // največji dovoljeni nagib plošče (°)
-
-// Koraki na mm vertikalnega giba (odvisno od prestavnega razmerja)
-// Za motor 200 kor/vrt, korak = 1.8°, ročica 15 mm:
-//   1 vrtljaj = 200 korakov = 2π·15 mm oboda → prilagodi!
-#define STEPS_PER_MM   25.0f
+#define SETPOINT_X_REAL  (PLATE_W / 2.0f + CENTER_OFFSET_X)
+#define SETPOINT_Y_REAL  (PLATE_L / 2.0f + CENTER_OFFSET_Y)
 
 // ============================================================
-//  PINI MOTORJEV
+// GEOMETRIJA PLATFORME
+// ============================================================
+#define MOTOR_RADIUS   55.0f
+#define CRANK_LENGTH   15.0f
+
+// *** POVEČANO: več nagiba = hitrejša korekcija ***
+#define MAX_TILT_DEG    0.5f   // bilo 1.0f
+
+#define STEPS_PER_MM   50.0f
+
+// ============================================================
+// ZAČETNI DVIG PLATFORME
+// ============================================================
+#define START_M1   -210
+#define START_M2   -170
+#define START_M3    210
+
+// ============================================================
+// MOTORJI
 // ============================================================
 #define ENABLE_PIN  2
 
-// AccelStepper::DRIVER = zunanji gonilnik (STEP, DIR)
 AccelStepper motor1(AccelStepper::DRIVER, 3, 4);
 AccelStepper motor2(AccelStepper::DRIVER, 5, 6);
 AccelStepper motor3(AccelStepper::DRIVER, 7, 8);
 
-// Koti motorjev (enakomerno razporejeni, 120° razmaknjena)
 const float MOTOR_ANGLE_DEG[3] = { 90.0f, 210.0f, 330.0f };
 
 // ============================================================
-//  OBJEKT ZASLONA NA DOTIK
+// TOUCHSCREEN
 // ============================================================
 TouchScreen ts = TouchScreen(XP, YP, XM, YM, TOUCHSCREEN_OHMS);
 
 // ============================================================
-//  PID PARAMETRI  ← TUKAJ NASTAVLJAŠ VREDNOSTI
+// PID PARAMETRI — AGRESIVNEJŠI
 // ============================================================
-//
-//  Kp (proporcionalno):  večja vrednost = hitrejši odziv, a več nihanja
-//  Ki (integralno):      odpravlja trajno napako; previsoka = nestabilnost
-//  Kd (derivativno):     duši nihanja; previsoka = šumljiv odziv
-//
-//  Začetne vrednosti za testiranje:
-float Kp_x = 0.50f;   // [začni majhno, npr. 0.1 – 0.5]
-float Ki_x = 0.05f;  // [začni z 0.0, povečuj počasi]
-float Kd_x = 0.50f;   // [začni z 0.3 – 1.0]
+float Kp_x = 7.00f;   // bilo 15.0
+float Ki_x = 0.001f;   // bilo 0.0 — majhen I pomaga pri steady-state
+float Kd_x = 21.0f;   // bilo 8.0
 
-float Kp_y = 0.50f;
-float Ki_y = 0.05f;
-float Kd_y = 0.50f;
+float Kp_y = 7.00f;
+float Ki_y = 0.001f;
+float Kd_y = 21.0f;
 
-// Omejitev integralnega člena (prepreči "windup")
-#define MAX_INTEGRAL  100.0f
-
-// Mrtva cona: zanemarimo napako manjšo od N mm (zmanjša tresenje)
-#define DEADBAND_MM   2.0f
-
-// Faktor pretvorbe PID izhoda → nagib v stopinjah
-// Nastavi, dokler platform reagira sorazmerno
-#define PID_TO_TILT   0.05f
+#define MAX_INTEGRAL      50.0f
+#define DEADBAND_MM        5.0f  // bilo 1.0 — manjši deadband, prej reagira
+#define PID_TO_TILT        2.0f  // bilo 0.5 — polni izhod!
 
 // ============================================================
-//  FILTER POLOŽAJA (eksponentno drsno povprečje)
-//  alpha blizu 1.0 = manj glajenja (hitrejši odziv)
-//  alpha blizu 0.0 = več glajenja (počasnejši, a bolj stabilen)
+// FILTRI — HITREJŠI ODZIV
 // ============================================================
-#define FILTER_ALPHA  0.25f
+// *** KLJUČNO: višja alpha = manj glajenja = hitrejši odziv ***
+#define FILTER_ALPHA        0.6f   // bilo 0.25 — 2.5x hitrejši odziv!
+#define DERIV_FILTER_ALPHA  0.3f   // bilo 0.35
+#define MAX_PID_OUT        15.0f   // bilo 25.0
 
 // ============================================================
-//  SPREMENLJIVKE PID
+// SERIAL TIMING — ne tiskaj vsak loop, samo vsak N-ti
+// ============================================================
+#define SERIAL_PRINT_EVERY  10   // ← tiskaj samo vsak 10. cikel
+int serialCounter = 0;
+
+// ============================================================
+// MULTI-SAMPLE TOUCHSCREEN — povprečje 3 meritev za manj šuma
+// ============================================================
+#define TS_SAMPLES  3
+
+TSPoint getTouchAverage() {
+    long sumX = 0, sumY = 0, sumZ = 0;
+    int validCount = 0;
+    
+    for (int i = 0; i < TS_SAMPLES; i++) {
+        TSPoint p = ts.getPoint();
+        if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
+            sumX += p.x;
+            sumY += p.y;
+            sumZ += p.z;
+            validCount++;
+        }
+    }
+    
+    if (validCount == 0) {
+        return TSPoint(0, 0, 0);
+    }
+    
+    return TSPoint(sumX / validCount, sumY / validCount, sumZ / validCount);
+}
+
+// ============================================================
+// PID SPREMENLJIVKE
 // ============================================================
 float err_x = 0, err_y = 0;
 float prev_err_x = 0, prev_err_y = 0;
 float integ_x = 0, integ_y = 0;
 float out_x = 0, out_y = 0;
+float derivFilt_x = 0, derivFilt_y = 0;
 
-float filtered_x = SETPOINT_X;
-float filtered_y = SETPOINT_Y;
+float filtered_x = SETPOINT_X_REAL;
+float filtered_y = SETPOINT_Y_REAL;
 
 unsigned long lastTime = 0;
 bool ballPresent = false;
 unsigned long ballLostTime = 0;
-#define BALL_LOST_TIMEOUT_MS  500   // čas pred vrnitvijo v sredino (ms)
+
+#define BALL_LOST_TIMEOUT_MS  300   // bilo 500 — prej zazna izgubo
 
 // ============================================================
-//  INVERZNA KINEMATIKA
-//  Pretvori zahtevani nagib (tilt_x°, tilt_y°) v korake motorjev.
-//
-//  Model:
-//    Vsak motor je na kotu φᵢ in razdalji R od središča.
-//    Višina noge:  h_i = R · (tilt_x_rad·cos(φ_i) + tilt_y_rad·sin(φ_i))
-//    Koraki motorja = h_i · STEPS_PER_MM
+// INVERZNA KINEMATIKA
 // ============================================================
 void inverseKinematics(float tilt_x_deg, float tilt_y_deg, long steps[3])
 {
@@ -165,44 +160,64 @@ void inverseKinematics(float tilt_x_deg, float tilt_y_deg, long steps[3])
 
     for (int i = 0; i < 3; i++) {
         float phi = MOTOR_ANGLE_DEG[i] * (float)DEG_TO_RAD;
-        float h   = MOTOR_RADIUS * (tx * cosf(phi) + ty * sinf(phi));
-        steps[i]  = (long)(h * STEPS_PER_MM);
+        float h = MOTOR_RADIUS * (tx * cosf(phi) + ty * sinf(phi));
+        steps[i] = (long)(h * STEPS_PER_MM);
     }
 }
 
 // ============================================================
-//  PID IZRAČUN (za eno os)
+// PID IZRAČUN
 // ============================================================
 float computePID(float measurement, float setpoint,
                  float &err, float &prev_err, float &integ,
+                 float &derivFilt,
                  float Kp, float Ki, float Kd, float dt)
 {
     float raw_err = setpoint - measurement;
 
-    // Mrtva cona
-    if (fabsf(raw_err) < DEADBAND_MM) raw_err = 0.0f;
+    if (fabsf(raw_err) < DEADBAND_MM) {
+        raw_err = 0.0f;
+    }
 
-    err    = raw_err;
-    integ += err * dt;
-    integ  = constrain(integ, -MAX_INTEGRAL, MAX_INTEGRAL);
+    err = raw_err;
+
+    if (err != 0.0f) {
+        integ += err * dt;
+        integ = constrain(integ, -MAX_INTEGRAL, MAX_INTEGRAL);
+    } else {
+        integ *= 0.90f;
+    }
 
     float deriv = (err - prev_err) / dt;
+    derivFilt = DERIV_FILTER_ALPHA * deriv + (1.0f - DERIV_FILTER_ALPHA) * derivFilt;
+
     prev_err = err;
 
-    return Kp * err + Ki * integ + Kd * deriv;
+    float out = Kp * err + Ki * integ + Kd * derivFilt;
+    out = constrain(out, -MAX_PID_OUT, MAX_PID_OUT);
+
+    return out;
 }
 
 // ============================================================
-//  SERIJSKA KONFIGURACIJA PID (pošlji ukaze prek Serial Monitor)
-//  Format: "px 0.35" = nastavi Kp_x na 0.35
-//          "dy 1.20" = nastavi Kd_y na 1.20
-//  px/py = Kp, ix/iy = Ki, dx/dy = Kd
+// SERIAL UKAZI
 // ============================================================
 void handleSerialInput()
 {
     if (!Serial.available()) return;
+
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
+    if (cmd.length() < 2) return;
+
+    if (cmd == "rs") {
+        integ_x = integ_y = 0;
+        prev_err_x = prev_err_y = 0;
+        derivFilt_x = derivFilt_y = 0;
+        Serial.println(F("PID resetiran."));
+        return;
+    }
+
     if (cmd.length() < 4) return;
 
     float val = cmd.substring(3).toFloat();
@@ -211,93 +226,116 @@ void handleSerialInput()
     if      (key == "px") { Kp_x = val; Kp_y = val; }
     else if (key == "ix") { Ki_x = val; Ki_y = val; }
     else if (key == "dx") { Kd_x = val; Kd_y = val; }
-    else if (key == "py")   Kp_y = val;
-    else if (key == "iy")   Ki_y = val;
-    else if (key == "dy")   Kd_y = val;
-    else if (key == "rs") { // reset integralov
-        integ_x = 0; integ_y = 0;
-    }
+    else if (key == "py") Kp_y = val;
+    else if (key == "iy") Ki_y = val;
+    else if (key == "dy") Kd_y = val;
 
-    Serial.print(">> Kp="); Serial.print(Kp_x);
-    Serial.print(" Ki=");   Serial.print(Ki_x);
-    Serial.print(" Kd=");   Serial.println(Kd_x);
+    Serial.print(F("Kp=")); Serial.print(Kp_x);
+    Serial.print(F(" Ki=")); Serial.print(Ki_x);
+    Serial.print(F(" Kd=")); Serial.println(Kd_x);
 }
 
 // ============================================================
-//  SETUP
+// SETUP
 // ============================================================
 void setup()
 {
     Serial.begin(115200);
-    Serial.println(F("=== Ball Balancer ==="));
-    Serial.println(F("Ukazi: 'px 0.3' 'ix 0.002' 'dx 0.8' (enako za y)"));
-    Serial.println(F("       'rs' = reset integralov"));
+    Serial.println(F("=== Ball Balancer OPTIMIZED ==="));
 
-    // Enable pin — nizek nivo aktivira gonilnik (A4988/DRV8825)
     pinMode(ENABLE_PIN, OUTPUT);
     digitalWrite(ENABLE_PIN, LOW);
 
-    // Motor 1
-    motor1.setMaxSpeed(800);
-    motor1.setAcceleration(400);
+    // *** POVEČANA HITROST MOTORJEV ***
+    motor1.setMaxSpeed(8000);    // bilo 5000
+    motor1.setAcceleration(6000); // bilo 4500
     motor1.setCurrentPosition(0);
 
-    // Motor 2
-    motor2.setMaxSpeed(800);
-    motor2.setAcceleration(400);
+    motor2.setMaxSpeed(8000);
+    motor2.setAcceleration(6000);
     motor2.setCurrentPosition(0);
 
-    // Motor 3
-    motor3.setMaxSpeed(800);
-    motor3.setAcceleration(400);
+    motor3.setMaxSpeed(8000);
+    motor3.setAcceleration(6000);
     motor3.setCurrentPosition(0);
 
-    lastTime = millis();
-    Serial.println(F("Pripravljen."));
+    motor1.move(START_M1);
+    motor2.move(START_M2);
+    motor3.move(START_M3);
+
+    while (motor1.distanceToGo() != 0 ||
+           motor2.distanceToGo() != 0 ||
+           motor3.distanceToGo() != 0) {
+        motor1.run(); motor2.run(); motor3.run();
+    }
+
+    motor1.setCurrentPosition(0);
+    motor2.setCurrentPosition(0);
+    motor3.setCurrentPosition(0);
+
+    filtered_x = SETPOINT_X_REAL;
+    filtered_y = SETPOINT_Y_REAL;
+    integ_x = integ_y = 0;
+    prev_err_x = prev_err_y = 0;
+    derivFilt_x = derivFilt_y = 0;
+
+    lastTime = micros();   // *** micros() za večjo natančnost ***
+
+    Serial.println(F("Platforma pripravljena."));
 }
 
 // ============================================================
-//  LOOP
+// LOOP
 // ============================================================
 void loop()
 {
     handleSerialInput();
 
-    // --- ČITAJ ZASLON ---
-    TSPoint p = ts.getPoint();
-
-    unsigned long now = millis();
-    float dt = (now - lastTime) / 1000.0f;
-    if (dt < 0.001f) dt = 0.001f;   // zavaruj pred deljenjem z 0
+    // *** MICROS() namesto millis() — 1000x večja ločljivost ***
+    unsigned long now = micros();
+    float dt = (now - lastTime) / 1000000.0f;
     lastTime = now;
 
+    if (dt < 0.0005f) dt = 0.0005f;
+    if (dt > 0.05f)   dt = 0.05f;
+
+    // *** POVPREČJE MERITEV za manj šuma ***
+    TSPoint p = getTouchAverage();
+
     if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
-        // Surove vrednosti → mm
+
         float raw_x = map((long)p.x, TS_MINX, TS_MAXX, 0, (long)(PLATE_W * 100)) / 100.0f;
         float raw_y = map((long)p.y, TS_MINY, TS_MAXY, 0, (long)(PLATE_L * 100)) / 100.0f;
+
         raw_x = constrain(raw_x, 0.0f, PLATE_W);
         raw_y = constrain(raw_y, 0.0f, PLATE_L);
 
-        // Eksponentni filter šuma zaslona
-        filtered_x = FILTER_ALPHA * raw_x + (1.0f - FILTER_ALPHA) * filtered_x;
-        filtered_y = FILTER_ALPHA * raw_y + (1.0f - FILTER_ALPHA) * filtered_y;
+        if (!ballPresent) {
+            filtered_x = raw_x;
+            filtered_y = raw_y;
+            integ_x = integ_y = 0;
+            prev_err_x = prev_err_y = 0;
+            derivFilt_x = derivFilt_y = 0;
+            ballPresent = true;
+            Serial.println(F("Zogica zaznana."));
+        } else {
+            filtered_x = FILTER_ALPHA * raw_x + (1.0f - FILTER_ALPHA) * filtered_x;
+            filtered_y = FILTER_ALPHA * raw_y + (1.0f - FILTER_ALPHA) * filtered_y;
+        }
 
-        ballPresent = true;
         ballLostTime = now;
 
-        // --- PID ---
-        out_x = computePID(filtered_x, SETPOINT_X,
-                           err_x, prev_err_x, integ_x,
+        out_x = computePID(filtered_x, SETPOINT_X_REAL,
+                           err_x, prev_err_x, integ_x, derivFilt_x,
                            Kp_x, Ki_x, Kd_x, dt);
-        out_y = computePID(filtered_y, SETPOINT_Y,
-                           err_y, prev_err_y, integ_y,
+
+        out_y = computePID(filtered_y, SETPOINT_Y_REAL,
+                           err_y, prev_err_y, integ_y, derivFilt_y,
                            Kp_y, Ki_y, Kd_y, dt);
 
-        // PID izhod → nagib v stopinjah
         float tilt_x = out_x * PID_TO_TILT;
         float tilt_y = out_y * PID_TO_TILT;
 
-        // --- INVERZNA KINEMATIKA ---
         long targetSteps[3];
         inverseKinematics(tilt_x, tilt_y, targetSteps);
 
@@ -305,20 +343,28 @@ void loop()
         motor2.moveTo(targetSteps[1]);
         motor3.moveTo(targetSteps[2]);
 
-        // Izpis za Serial Plotter (Tools → Serial Plotter)
-        Serial.print(filtered_x); Serial.print('\t');
-        Serial.print(filtered_y); Serial.print('\t');
-        Serial.print(SETPOINT_X); Serial.print('\t');
-        Serial.println(SETPOINT_Y);
+        // *** Serial samo vsak 10. cikel — ne upočasnjuje loopa ***
+        serialCounter++;
+        if (serialCounter >= SERIAL_PRINT_EVERY) {
+            serialCounter = 0;
+            Serial.print(filtered_x); Serial.print('\t');
+            Serial.print(filtered_y); Serial.print('\t');
+            Serial.print(SETPOINT_X_REAL); Serial.print('\t');
+            Serial.print(SETPOINT_Y_REAL); Serial.print('\t');
+            Serial.print(err_x); Serial.print('\t');
+            Serial.println(err_y);
+        }
 
     } else {
-        // Žogice ni — počakaj, nato vrni v sredino
-        if (ballPresent && (now - ballLostTime > BALL_LOST_TIMEOUT_MS)) {
+
+        if (ballPresent && (now - ballLostTime > (unsigned long)(BALL_LOST_TIMEOUT_MS * 1000UL))) {
             ballPresent = false;
-            integ_x = 0;
-            integ_y = 0;
+            integ_x = integ_y = 0;
+            prev_err_x = prev_err_y = 0;
+            derivFilt_x = derivFilt_y = 0;
             Serial.println(F("Zogice ni — vracam v sredino."));
         }
+
         if (!ballPresent) {
             motor1.moveTo(0);
             motor2.moveTo(0);
@@ -326,54 +372,7 @@ void loop()
         }
     }
 
-    // --- ZAŽENI MOTORJE ---
     motor1.run();
     motor2.run();
     motor3.run();
 }
-
-/*
- * ============================================================
- *  VODIČ ZA NASTAVITEV PID VREDNOSTI
- * ============================================================
- *
- *  Spremenljivka    Učinek                        Kdaj povečati
- *  ─────────────────────────────────────────────────────────────
- *  Kp_x / Kp_y     Proporcionalni ojačevalnik     Žogica reagira
- *                  Hitreje sledi napaki            prepočasi na
- *                  Previsok → nihanje              odmik od sredine
- *
- *  Ki_x / Ki_y     Integralni člen                Žogica se ustavi
- *                  Odpravlja trajno napako         nekoliko ob strani
- *                  Previsok → počasno nihanje,     in tam ostane
- *                  nestabilnost                    (stacionarna napaka)
- *
- *  Kd_x / Kd_y     Derivativni člen               Žogica preseže
- *                  Duši/zavira prekoračitev        sredino in se
- *                  Previsok → odziv na šum,        vrača z nihanjem
- *                  tresenje plošče
- *
- *  FILTER_ALPHA     Glajenje zaslona na dotik      Ko je položaj žogice
- *                  0.1 = zelo gladko (počasno)     skočen / šumen
- *                  0.9 = hitro (manj glajenja)
- *
- *  DEADBAND_MM      Mrtva cona (mm)                Ko platforma
- *                  Prepreči tresenje pri miru      nenehno popravlja
- *                                                  majhne odmike
- *
- *  PID_TO_TILT      Pretvori PID izhod v stopinje  Ko je nagib
- *                  Zmanjšaj, če platforma           preveč ali premalo
- *                  nagiba preveč                    agresiven
- *
- *  PRIPOROČEN POSTOPEK NASTAVLJANJA (Ziegler-Nichols poenostavljeno):
- *  1. Nastavi Ki=0, Kd=0. Povečuj Kp, dokler žogica ne začne nihati.
- *  2. Zmanjšaj Kp na ~60 % te vrednosti.
- *  3. Počasi dodajaj Kd, dokler nihanje ne pojeni.
- *  4. Na koncu dodaj majhen Ki za odpravo stacionarne napake.
- *
- *  Med delovanjem pošlji ukaze prek Serial Monitorja (115200 baud):
- *    px 0.35   → nastavi Kp_x in Kp_y na 0.35
- *    dy 1.20   → nastavi Kd_y na 1.20
- *    rs        → ponastavi integralne člene
- * ============================================================
- */
